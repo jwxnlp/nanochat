@@ -16,17 +16,36 @@ python -m scripts.chat_rl
 torchrun --standalone --nproc_per_node=8 -m scripts.chat_rl -- --run=default
 """
 
-import os
+import os, logging, time
 import itertools
 import re
 import wandb
 import torch
 import torch.distributed as dist
-
+from torch.utils.tensorboard import SummaryWriter
 from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, DummyWandb
 from nanochat.checkpoint_manager import save_checkpoint, load_model
 from nanochat.engine import Engine
 from tasks.gsm8k import GSM8K
+
+def get_logger(timestamp, log_dir, mode="w", log_level=logging.INFO):
+    """"""
+    logger = logging.getLogger(__name__)
+    logger.setLevel(log_level)
+
+    logger.root.handlers[0].setLevel(logging.ERROR)
+
+    rank = int(os.environ['LOCAL_RANK'])
+    log_path = os.path.join(log_dir, f"{timestamp}_rank{rank}.log")
+    file_handler = logging.FileHandler(log_path, mode)
+    file_handler.setFormatter(
+        logging.Formatter("%(asctime)s - %(levelname)s - %(module)s - %(message)s")
+    )
+    file_handler.setLevel(logging.NOTSET)
+    logger.addHandler(file_handler)
+    
+    return logger
+
 
 # RL hyperparameters
 run = "dummy" # wandb run name
@@ -66,6 +85,18 @@ wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat-rl
 # Init model and tokenizer
 model, tokenizer, meta = load_model(source, device, phase="eval")
 engine = Engine(model, tokenizer) # for sampling rollouts
+
+base_dir = get_base_dir()
+timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+depth = model.config.n_layer
+output_dirname = f"d{depth}" # e.g. d12
+log_dir = os.path.join(base_dir, "chatrl_logs", output_dirname)
+os.makedirs(log_dir, exist_ok=True)
+logger = get_logger(timestamp, log_dir)
+if master_process:
+    tf_log_dir = os.path.join(base_dir, "chatrl_tf_logs", output_dirname)
+    os.makedirs(tf_log_dir, exist_ok=True)
+    writer = SummaryWriter(tf_log_dir)
 
 # -----------------------------------------------------------------------------
 # Rollout / sampling generator loop that yields batches of examples for training
@@ -231,12 +262,19 @@ for step in range(num_steps):
             dist.all_reduce(passk, op=dist.ReduceOp.SUM)
         passk = passk / num_records.item() # normalize by the total number of records
         print_passk = [f"Pass@{k}: {passk[k - 1].item():.4f}" for k in range(1, device_batch_size + 1)]
-        print0(f"Step {step} | {', '.join(print_passk)}")
+        msg = f"Step {step} | {', '.join(print_passk)}"
+        print0(msg)
+        logger.info(msg)
         log_passk = {f"pass@{k}": passk[k - 1].item() for k in range(1, device_batch_size + 1)}
         wandb_run.log({
             "step": step,
             **log_passk,
         })
+        if master_process:
+            for name, val in log_passk.items():
+                writer.add_scalar(
+                    name, val, step
+                )
 
     # Forward/Backward on rollouts over multiple examples in the dataset
     rewards_list = []
@@ -268,7 +306,9 @@ for step in range(num_steps):
             # Finally, formulate the loss that we want to minimize (instead of objective we wish to maximize)
             loss = -pg_obj
             loss.backward()
-            print0(f"Step {step}/{num_steps} | Example step {example_step} | Pass {pass_idx} | loss: {loss.item():.6f} | Average reward: {rewards.mean().item()}")
+            msg = f"Step {step}/{num_steps} | Example step {example_step} | Pass {pass_idx} | loss: {loss.item():.6f} | Average reward: {rewards.mean().item()}"
+            print0(msg)
+            logger.info(msg)
         # For logging
         rewards_list.append(rewards_all.mean().item())
         sequence_lengths.extend(len(seq) for seq in sequences_all)
@@ -283,12 +323,22 @@ for step in range(num_steps):
         dist.all_reduce(mean_sequence_length_tensor, op=dist.ReduceOp.AVG)
         mean_reward = mean_reward_tensor.item()
         mean_sequence_length = mean_sequence_length_tensor.item()
-    print0(f"Step {step}/{num_steps} | Average reward: {mean_reward} | Average sequence length: {mean_sequence_length:.2f}")
-    wandb_run.log({
+    f"Step {step}/{num_steps} | Average reward: {mean_reward} | Average sequence length: {mean_sequence_length:.2f}"
+    print0(msg)
+    logger.info(msg)
+    log_data = {
         "step": step,
         "reward": mean_reward,
         "sequence_length": mean_sequence_length,
-    })
+    }
+    wandb_run.log(log_data)
+    if master_process:
+        for name, val in log_data.items():
+            if name == "step":
+                continue
+            writer.add_scalar(
+                name, val, step
+            )
 
     # Update the model parameters
     lrm = get_lr_multiplier(step)
@@ -302,6 +352,10 @@ for step in range(num_steps):
         "step": step,
         "lrm": lrm,
     })
+    if master_process:
+        writer.add_scalar(
+            "lrm", lrm, step
+        )
 
     # Master process saves the model once in a while. Skip first step. Save last step.
     if master_process and ((step > 0 and step % save_every == 0) or step == num_steps - 1):

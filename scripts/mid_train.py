@@ -10,11 +10,12 @@ torchrun --standalone --nproc_per_node=8 -m scripts.mid_train -- --device_batch_
 """
 
 from collections import deque
-import os
+import os, logging
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import time
 import wandb
 import torch
+from torch.utils.tensorboard import SummaryWriter
 from contextlib import nullcontext
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, get_base_dir, autodetect_device_type
 from nanochat.tokenizer import get_token_bytes
@@ -30,6 +31,23 @@ from tasks.smoltalk import SmolTalk
 from tasks.customjson import CustomJSON
 from tasks.spellingbee import SimpleSpelling, SpellingBee
 
+def get_logger(timestamp, log_dir, mode="w", log_level=logging.INFO):
+    """"""
+    logger = logging.getLogger(__name__)
+    logger.setLevel(log_level)
+
+    logger.root.handlers[0].setLevel(logging.ERROR)
+
+    rank = int(os.environ['LOCAL_RANK'])
+    log_path = os.path.join(log_dir, f"{timestamp}_rank{rank}.log")
+    file_handler = logging.FileHandler(log_path, mode)
+    file_handler.setFormatter(
+        logging.Formatter("%(asctime)s - %(levelname)s - %(module)s - %(message)s")
+    )
+    file_handler.setLevel(logging.NOTSET)
+    logger.addHandler(file_handler)
+    
+    return logger
 # -----------------------------------------------------------------------------
 run = "dummy" # wandb run name default ("dummy" is special - we won't log to wandb)
 device_type = "" # cuda|cpu|mps (empty => autodetect)
@@ -94,6 +112,15 @@ for opt in optimizers:
 
 # Midtraining data mixture and DataLoader
 base_dir = get_base_dir()
+timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+output_dirname = model_tag if model_tag else f"d{depth}" # e.g. d12
+log_dir = os.path.join(base_dir, "mid_logs", output_dirname)
+os.makedirs(log_dir, exist_ok=True)
+logger = get_logger(timestamp, log_dir)
+if master_process:
+    tf_log_dir = os.path.join(base_dir, "mid_tf_logs", output_dirname)
+    os.makedirs(tf_log_dir, exist_ok=True)
+    writer = SummaryWriter(tf_log_dir)
 identity_conversations_filepath = os.path.join(base_dir, "identity_conversations.jsonl")
 train_dataset = TaskMixture([
     SmolTalk(split="train"), # 460K rows of general conversations
@@ -194,15 +221,22 @@ while True:
         eval_steps = eval_tokens // (device_batch_size * max_seq_len * ddp_world_size)
         with autocast_ctx:
             val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
-        print0(f"Step {step:05d} | Validation bpb: {val_bpb:.4f}")
+        msg = f"Step {step:05d} | Validation bpb: {val_bpb:.4f}"
+        print0(msg)
+        logger.info(msg)
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
-        wandb_run.log({
+        log_data = {
             "step": step,
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
             "val/bpb": val_bpb,
-        })
+        }
+        wandb_run.log(log_data)
+        if master_process:
+            writer.add_scalar(
+                "val/bpb", val_bpb, step
+            )
         model.train()
 
     # save checkpoint at the end of the run (only on master process)
@@ -274,9 +308,11 @@ while True:
     mfu = 100 * flops_per_sec / promised_flops_per_sec_h100 # in %
     if step > 10:
         total_training_time += dt # only count the time after the first 10 steps
-    print0(f"step {step:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | total time: {total_training_time/60:.2f}m")
+    msg = f"step {step:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | total time: {total_training_time/60:.2f}m"
+    print0(msg)
     if step % 10 == 0:
-        wandb_run.log({
+        logger.info(msg)
+        log_data = {
             "step": step,
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
@@ -285,7 +321,15 @@ while True:
             "train/dt": dt,
             "train/tok_per_sec": tok_per_sec,
             "train/mfu": mfu,
-        })
+        }
+        if master_process:
+            for name, val in log_data.items():
+                if name == "step":
+                    continue
+                writer.add_scalar(
+                    f"{name}", val, step
+                )
+        wandb_run.log(log_data)
 
 # print a few more stats
 print0(f"Peak memory usage: {get_max_memory() / 1024 / 1024:.2f}MiB")

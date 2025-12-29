@@ -9,12 +9,13 @@ Or torchrun for training:
 torchrun --standalone --nproc_per_node=8 -m scripts.chat_sft
 """
 
-import os
+import os, logging, time
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import wandb
 import torch
 import torch.distributed as dist
+from torch.utils.tensorboard import SummaryWriter
 from contextlib import nullcontext
 
 from nanochat.common import compute_init, compute_cleanup, get_base_dir, print0, DummyWandb, autodetect_device_type
@@ -30,6 +31,23 @@ from tasks.smoltalk import SmolTalk
 from tasks.customjson import CustomJSON
 from tasks.spellingbee import SimpleSpelling, SpellingBee
 
+def get_logger(timestamp, log_dir, mode="w", log_level=logging.INFO):
+    """"""
+    logger = logging.getLogger(__name__)
+    logger.setLevel(log_level)
+
+    logger.root.handlers[0].setLevel(logging.ERROR)
+
+    rank = int(os.environ['LOCAL_RANK'])
+    log_path = os.path.join(log_dir, f"{timestamp}_rank{rank}.log")
+    file_handler = logging.FileHandler(log_path, mode)
+    file_handler.setFormatter(
+        logging.Formatter("%(asctime)s - %(levelname)s - %(module)s - %(message)s")
+    )
+    file_handler.setLevel(logging.NOTSET)
+    logger.addHandler(file_handler)
+    
+    return logger
 # -----------------------------------------------------------------------------
 # SFT Hyperparameters
 run = "dummy" # wandb run name default ("dummy" is special - we won't log to wandb)
@@ -77,6 +95,18 @@ model, tokenizer, meta = load_model(source, device, phase="train", model_tag=mod
 orig_model = model # original, uncompiled model
 # model = torch.compile(model, dynamic=True) # doesn't work super well because of variable lengths of inputs
 engine = Engine(model, tokenizer) # will be used for inline model evaluation only
+
+base_dir = get_base_dir()
+timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+depth = model.config.n_layer
+output_dirname = model_tag if model_tag else f"d{depth}" # e.g. d12
+log_dir = os.path.join(base_dir, "chatsft_logs", output_dirname)
+os.makedirs(log_dir, exist_ok=True)
+logger = get_logger(timestamp, log_dir)
+if master_process:
+    tf_log_dir = os.path.join(base_dir, "chatsft_tf_logs", output_dirname)
+    os.makedirs(tf_log_dir, exist_ok=True)
+    writer = SummaryWriter(tf_log_dir)
 
 # -----------------------------------------------------------------------------
 # Task data mixture we'll train on
@@ -184,11 +214,17 @@ for step in range(num_iterations):
         if ddp:
             dist.all_reduce(val_loss, op=dist.ReduceOp.AVG) # average over ranks
         val_loss = val_loss.item()
-        print0(f"Step {step:05d} | Validation loss: {val_loss:.6f}")
+        msg = f"Step {step:05d} | Validation loss: {val_loss:.6f}"
+        print0(msg)
+        logger.info(msg)
         wandb_run.log({
             "step": step,
             "val_loss": val_loss,
         })
+        if master_process:
+            writer.add_scalar(
+                "val_loss", val_loss, step
+            )
         model.train()
 
     # evaluate accuracy of the multiple choice tasks (which are quick to run)
@@ -200,11 +236,18 @@ for step in range(num_iterations):
             metrics["mmlu_acc"] = run_chat_eval("MMLU", model, tokenizer, engine, batch_size=device_batch_size*2, max_problems=eval_metrics_max_problems)
             metrics["arc_easy_acc"] = run_chat_eval("ARC-Easy", model, tokenizer, engine, batch_size=device_batch_size*2, max_problems=eval_metrics_max_problems)
         metrics_str = ', '.join(f'{k}: {v:.6f}' for k, v in metrics.items())
-        print0(f"Step {step:05d} | {metrics_str}")
+        msg = f"Step {step:05d} | {metrics_str}"
+        print0(msg)
+        logger.info(msg)
         wandb_run.log({
             "step": step,
             **metrics,
         })
+        if master_process:
+            for name, val in metrics.items():
+                writer.add_scalar(
+                    f"metrics/{name}", val, step
+                )
         model.train()
 
     if last_step:
@@ -237,13 +280,23 @@ for step in range(num_iterations):
     # logging
     train_loss_item = train_loss.item()
     num_tokens_item = num_tokens.item()
-    print0(f"Step {step:05d}/{num_iterations:05d} | Training loss: {train_loss_item:.6f}| lrm: {lrm:.6f}| num_tokens: {num_tokens_item:,}")
-    wandb_run.log({
+    msg = f"Step {step:05d}/{num_iterations:05d} | Training loss: {train_loss_item:.6f}| lrm: {lrm:.6f}| num_tokens: {num_tokens_item:,}"
+    print0(msg)
+    logger.info(msg)
+    log_data = {
         "step": step,
         "lrm": lrm,
         "train_loss": train_loss_item,
         "num_tokens": num_tokens_item,
-    })
+    }
+    wandb_run.log(log_data)
+    if master_process:
+        for name, val in log_data.items():
+            if name == "step":
+                continue
+            writer.add_scalar(
+                f"{name}", val, step
+            )
     step += 1
 
 # Save the model at the end of the run
